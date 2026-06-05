@@ -1,0 +1,6 @@
+.env
+alarms.db
+__pycache__/
+*.pyc
+.venv/
+venv/
