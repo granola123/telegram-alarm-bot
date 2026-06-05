@@ -5,7 +5,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytz
@@ -82,6 +82,33 @@ def cancel_alarm(alarm_id: int, chat_id: int) -> bool:
             (alarm_id, chat_id),
         )
         return cur.rowcount > 0
+
+
+DATE_KEYWORDS = ("내일", "모레", "글피", "다음날", "tomorrow", "day after")
+
+
+def format_alarm_message(message: str) -> str:
+    text = message.strip().strip("⏰").strip()
+    return f"⏰{text}⏰"
+
+
+def infer_today_if_no_date(user_message: str, time_str: str) -> str:
+    """날짜를 말하지 않았는데 AI가 내일로 잡은 경우, 오늘로 보정."""
+    if any(keyword in user_message for keyword in DATE_KEYWORDS):
+        return time_str
+
+    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    now = datetime.now(KST)
+    today = now.date()
+
+    if dt.date() != today + timedelta(days=1):
+        return time_str
+
+    today_at_time = KST.localize(datetime.combine(today, dt.time()))
+    if today_at_time > now:
+        return today_at_time.strftime("%Y-%m-%d %H:%M:00")
+
+    return time_str
 
 
 def normalize_alarm_time(time_str: str) -> str:
@@ -162,14 +189,21 @@ def parse_alarm_with_ai(user_message: str) -> dict | None:
         f"Current KST: {now_kst}. "
         f"Return JSON with exactly two keys:\n"
         f'  "datetime": "YYYY-MM-DD HH:MM:00" (KST, must be in the future)\n'
-        f'  "task": alarm description string\n'
-        f"Date rules (important):\n"
-        f"- If the user gives a clock time still later TODAY, use TODAY's date.\n"
+        f'  "message": short friendly Korean alarm text (no emoji)\n'
+        f"Date rules (very important):\n"
+        f"- If the user does NOT mention a date (no 오늘/내일/모레/tomorrow), "
+        f"assume TODAY when that clock time is still later today.\n"
+        f"- Example: at 14:00, user says '5시에 밥먹으라해줘' → datetime is TODAY 17:00.\n"
         f"- Use TOMORROW only if that clock time already passed today, "
-        f"or the user says tomorrow/내일/다음날.\n"
+        f"or the user explicitly says tomorrow/내일/다음날/모레.\n"
         f"- For relative times (e.g. 30 minutes later), compute from current KST.\n"
+        f"Message rules:\n"
+        f"- Convert the request into a natural short Korean phrase ending with ~입니다 or ~해요.\n"
+        f"- Example: '밥 먹으라' → '식사 시간입니다'\n"
+        f"- Example: '약 먹으라' → '약 먹을 시간입니다'\n"
+        f"- Do NOT include ⏰ emoji in the message.\n"
         f"If message is NOT an alarm request, return "
-        f'{{"datetime": null, "task": null}}.'
+        f'{{"datetime": null, "message": null}}.'
     )
 
     try:
@@ -209,8 +243,10 @@ def handle_start(chat_id: int):
         chat_id,
         "🤖 AI 알람봇입니다!\n\n"
         "• 자유롭게 말하면 알람 등록\n"
+        '  예) "5시에 밥 먹으라해줘" → ⏰식사 시간입니다⏰\n'
         '  예) "내일 오후 3시에 회의"\n'
         '  예) "30분 뒤에 약 먹기"\n\n'
+        "• 날짜를 안 말하면 오늘로 설정\n"
         "• /list — 등록된 알람 보기\n"
         "• /cancel [번호] — 알람 취소",
     )
@@ -225,7 +261,9 @@ def handle_list(chat_id: int):
     lines = ["📋 등록된 알람 목록:\n"]
     for alarm_id, alarm_time, task in alarms:
         dt = datetime.strptime(alarm_time, "%Y-%m-%d %H:%M:%S")
-        lines.append(f"[{alarm_id}] {dt.strftime('%m/%d %H:%M')} — {task}")
+        lines.append(
+            f"[{alarm_id}] {dt.strftime('%m/%d %H:%M')} — {format_alarm_message(task)}"
+        )
     lines.append("\n취소: /cancel [번호]")
     send_message(chat_id, "\n".join(lines))
 
@@ -246,33 +284,35 @@ def handle_cancel(chat_id: int, text: str):
 def handle_alarm_request(chat_id: int, user_message: str):
     result = parse_alarm_with_ai(user_message)
 
-    if not result or not result.get("datetime") or not result.get("task"):
+    alarm_message = (result or {}).get("message") or (result or {}).get("task")
+    if not result or not result.get("datetime") or not alarm_message:
         send_message(
             chat_id,
             "❌ 알람으로 인식하지 못했습니다.\n"
-            '예) "오후 5시에 운동", "내일 아침 9시 회의"',
+            '예) "5시에 밥 먹으라해줘", "내일 아침 9시 회의"',
         )
         return
 
     time_str = normalize_alarm_time(result["datetime"])
-    task = result["task"].strip()
+    time_str = infer_today_if_no_date(user_message, time_str)
+    alarm_message = alarm_message.strip()
 
     ok, err = validate_alarm_time(time_str)
     if not ok:
         send_message(chat_id, f"❌ {err}")
         return
 
-    alarm_id = save_alarm(chat_id, time_str, task)
+    alarm_id = save_alarm(chat_id, time_str, alarm_message)
     dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    preview = format_alarm_message(alarm_message)
 
     send_message(
         chat_id,
         f"✅ 알람 등록 완료! (#{alarm_id})\n"
         f"📅 {dt.strftime('%Y-%m-%d %H:%M')} (한국시간)\n"
-        f"🔔 {task}\n\n"
-        f"⚠️ 날짜가 맞는지 확인하세요. 틀리면 /cancel {alarm_id} 후 다시 등록하세요.",
+        f"🔔 {preview}",
     )
-    logger.info("Alarm saved #%s: %s @ %s", alarm_id, task, time_str)
+    logger.info("Alarm saved #%s: %s @ %s", alarm_id, alarm_message, time_str)
 
 
 def process_message(chat_id: int, text: str):
@@ -305,7 +345,7 @@ def alarm_checker_loop():
             due = fetch_due_alarms(now_str)
 
             for alarm_id, chat_id, task in due:
-                send_message(chat_id, f"⏰ 알람 시간입니다!\n📌 {task}")
+                send_message(chat_id, format_alarm_message(task))
                 mark_sent(alarm_id)
                 logger.info("Alarm fired #%s: %s", alarm_id, task)
 
