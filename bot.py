@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 import sqlite3
 import threading
 import time
@@ -22,8 +21,16 @@ ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()
 KST = pytz.timezone("Asia/Seoul")
 PROJECT_DIR = Path(__file__).parent
 DB_PATH = PROJECT_DIR / "alarms.db"
-ENV_PATH = PROJECT_DIR / ".env"
-PLACEHOLDER_CHAT_IDS = {"", "123456789"}
+PLACEHOLDER_CHAT_IDS = {"123456789"}
+
+
+def get_allowed_chat_ids() -> set[str]:
+    ids = set()
+    for part in ALLOWED_CHAT_ID.split(","):
+        value = part.strip()
+        if value and value not in PLACEHOLDER_CHAT_IDS:
+            ids.add(value)
+    return ids
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -148,37 +155,11 @@ def send_message(chat_id: int, text: str):
         logger.error("Telegram send error: %s", e)
 
 
-def persist_allowed_chat_id(chat_id: int):
-    global ALLOWED_CHAT_ID
-    ALLOWED_CHAT_ID = str(chat_id)
-    if not ENV_PATH.exists():
-        return
-    text = ENV_PATH.read_text(encoding="utf-8")
-    if re.search(r"^ALLOWED_CHAT_ID=", text, re.M):
-        text = re.sub(
-            r"^ALLOWED_CHAT_ID=.*$",
-            f"ALLOWED_CHAT_ID={chat_id}",
-            text,
-            flags=re.M,
-        )
-    else:
-        text = text.rstrip() + f"\nALLOWED_CHAT_ID={chat_id}\n"
-    ENV_PATH.write_text(text, encoding="utf-8")
-    logger.info("Saved ALLOWED_CHAT_ID=%s to .env", chat_id)
-
-
 def is_allowed(chat_id: int) -> bool:
-    global ALLOWED_CHAT_ID
-    if ALLOWED_CHAT_ID in PLACEHOLDER_CHAT_IDS:
-        persist_allowed_chat_id(chat_id)
-        send_message(
-            chat_id,
-            f"✅ 이 계정이 봇 사용자로 등록되었습니다. (chat_id: {chat_id})",
-        )
+    allowed = get_allowed_chat_ids()
+    if not allowed:
         return True
-    if not ALLOWED_CHAT_ID:
-        return True
-    return str(chat_id) == ALLOWED_CHAT_ID
+    return str(chat_id) in allowed
 
 
 def parse_alarm_with_ai(user_message: str) -> dict | None:
@@ -321,7 +302,7 @@ def process_message(chat_id: int, text: str):
             chat_id,
             "⛔ 이 봇은 허용된 사용자만 사용할 수 있습니다.\n\n"
             f"본인 chat_id: {chat_id}\n"
-            ".env(또는 Render)의 ALLOWED_CHAT_ID에 위 숫자를 넣고 봇을 재시작하세요.",
+            "관리자에게 위 숫자를 보내 ALLOWED_CHAT_ID에 추가해 달라고 요청하세요.",
         )
         return
 
